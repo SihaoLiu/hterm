@@ -287,84 +287,8 @@ fn kanban_counts_from_snapshot(snapshot: &Value) -> (usize, usize, usize) {
 }
 
 fn kanban_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
-    let artifact_count = snapshot
-        .get("artifact_count")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let mut lines = vec![
-        "H2 Kanban View".to_string(),
-        format!("artifacts {artifact_count}"),
-        String::new(),
-    ];
-
-    if let Some(items) = snapshot.get("slots").and_then(Value::as_array) {
-        if !items.is_empty() {
-            lines.push("Slots".to_string());
-            for item in items.iter().take(6) {
-                let slot = item
-                    .get("slot")
-                    .map(format_slot)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let head = item
-                    .get("head")
-                    .and_then(Value::as_str)
-                    .map(short_artifact_id)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let seq = item.get("seq").and_then(Value::as_u64).unwrap_or_default();
-                lines.push(format!("{slot}  {head}  seq {seq}"));
-            }
-            lines.push(String::new());
-        }
-    }
-
-    lines.push("Events".to_string());
-
-    if let Some(items) = snapshot.get("events").and_then(Value::as_array) {
-        for item in items.iter().take(10) {
-            let seq = item.get("seq").and_then(Value::as_u64).unwrap_or_default();
-            let kind = item
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            lines.push(format!("{seq}  {kind}"));
-        }
-    }
-
-    lines.push(String::new());
-    lines.push("Artifacts".to_string());
-
-    if let Some(items) = snapshot.get("artifacts").and_then(Value::as_array) {
-        for item in items.iter().take(8) {
-            let seq = item.get("seq").and_then(Value::as_u64).unwrap_or_default();
-            let kind = item
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let slot = item
-                .get("slot")
-                .map(format_slot)
-                .unwrap_or_else(|| "unknown".to_string());
-            lines.push(format!("{seq}  {kind}  {slot}"));
-        }
-    }
-
-    lines
-}
-
-fn format_slot(slot: &Value) -> String {
-    let node = slot
-        .get("node")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let name = slot
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    format!("{node}/{name}")
-}
-
-fn short_artifact_id(id: &str) -> String {
-    id.chars().take(8).collect()
+    let _ = snapshot;
+    Vec::new()
 }
 
 fn send_rpc(socket_path: &Path, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -540,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn kanban_lines_show_events_and_artifacts_from_snapshot() {
+    fn kanban_lines_leave_native_board_uncovered() {
         let snapshot = serde_json::json!({
             "events": [
                 {"seq": 8, "type": "node_registered"},
@@ -559,22 +483,6 @@ mod tests {
             ]
         });
 
-        assert_eq!(
-            kanban_lines_from_snapshot(&snapshot),
-            vec![
-                "H2 Kanban View".to_string(),
-                "artifacts 1".to_string(),
-                "".to_string(),
-                "Slots".to_string(),
-                "canvas/note  01234567  seq 7".to_string(),
-                "".to_string(),
-                "Events".to_string(),
-                "8  node_registered".to_string(),
-                "9  trace_log".to_string(),
-                "".to_string(),
-                "Artifacts".to_string(),
-                "7  text  canvas/note".to_string()
-            ]
-        );
+        assert_eq!(kanban_lines_from_snapshot(&snapshot), Vec::<String>::new());
     }
 }

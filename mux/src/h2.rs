@@ -64,7 +64,7 @@ impl H2Pane {
             pane_id: alloc_pane_id(),
             kind,
             size: Mutex::new(size),
-            source_lines: Mutex::new(vec![kind.title().to_string()]),
+            source_lines: Mutex::new(Vec::new()),
             rendered_lines: Mutex::new(Vec::new()),
             seqno: AtomicUsize::new(1),
             dead: AtomicBool::new(false),
