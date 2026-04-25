@@ -111,11 +111,15 @@ fedora_deps() {
   # Fedora 41 and above split a part of openssl-devel into openssl-devel-engine.
   # CentOS/RHEL 10 are doing the same thing. Some RHEL-derived distros report
   # VERSION_ID as "10.1" or similar (major.minor), so strip the minor part
-  # before the integer comparison.
+  # before the integer comparison. Some RHEL-derived distros also do not
+  # actually carry the engine subpackage in their default repos (it lives in
+  # CRB / EPEL), so the install is best-effort -- the linker will surface a
+  # real error later if it turns out we needed it.
   MAJOR_VERSION_ID="${VERSION_ID%%.*}"
   if { [ "$MAJOR_VERSION_ID" -ge "41" ] && [ "$ID" == "fedora" ]; } \
      || { [ "$MAJOR_VERSION_ID" -ge "10" ] && [ "$ID" != "fedora" ]; }; then
-    $YUM install -y 'openssl-devel-engine'
+    $YUM install -y 'openssl-devel-engine' || \
+      echo "warning: openssl-devel-engine not available; continuing without it"
   fi
 }
 
