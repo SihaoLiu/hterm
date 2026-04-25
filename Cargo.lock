@@ -3484,6 +3484,7 @@ dependencies = [
  "promise",
  "rangeset",
  "serde",
+ "serde_json",
  "serial2",
  "shell-words",
  "smol",

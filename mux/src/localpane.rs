@@ -160,6 +160,11 @@ impl Pane for LocalPane {
             );
         }
 
+        map.insert(
+            Value::String("h2_node_id".to_string()),
+            Value::String(crate::h2::node_id_for_pane(self.pane_id)),
+        );
+
         Value::Object(map.into())
     }
 
@@ -1001,6 +1006,7 @@ impl LocalPane {
             tmux_domain: None,
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
+        crate::h2::maybe_register_local_pane(pane_id, command_description.clone());
 
         Self {
             pane_id,
@@ -1136,6 +1142,7 @@ impl LocalPane {
 
 impl Drop for LocalPane {
     fn drop(&mut self) {
+        crate::h2::maybe_unregister_local_pane(self.pane_id, "pane dropped");
         // Avoid lingering zombies if we can, but don't block forever.
         // <https://github.com/wezterm/wezterm/issues/558>
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
