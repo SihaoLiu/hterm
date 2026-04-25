@@ -7,7 +7,7 @@ use crate::termwindow::render::{
 };
 use crate::termwindow::{ScrollHit, UIItem, UIItemType};
 use ::window::bitmaps::TextureRect;
-use ::window::DeadKeyStatus;
+use ::window::{DeadKeyStatus, RectF};
 use anyhow::Context;
 use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
@@ -170,6 +170,20 @@ impl crate::TermWindow {
             } else {
                 Some(config.inactive_pane_hsb)
             });
+        }
+
+        let pane_content_rect = euclid::rect(
+            padding_left + border.left.get() as f32 + (pos.left as f32 * cell_width),
+            top_pixel_y + (pos.top as f32 * cell_height),
+            pos.width as f32 * cell_width,
+            pos.height as f32 * cell_height,
+        );
+        let h2_metadata = pos.pane.get_metadata();
+        if h2_metadata_string(&h2_metadata, "h2_pane_kind") == Some("graph") {
+            let graph_node_count =
+                h2_metadata_u64(&h2_metadata, "h2_graph_node_count").unwrap_or_default() as usize;
+            self.paint_h2_graph_canvas(layers, pane_content_rect, graph_node_count, pos.is_active)
+                .context("paint_h2_graph_canvas")?;
         }
 
         {
@@ -582,6 +596,182 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    fn paint_h2_graph_canvas(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        node_count: usize,
+        is_active: bool,
+    ) -> anyhow::Result<()> {
+        let width = rect.width().max(1.0);
+        let height = rect.height().max(1.0);
+        let margin = 8.0;
+        if width <= margin * 2.0 || height <= margin * 2.0 {
+            return Ok(());
+        }
+
+        let canvas = euclid::rect(
+            rect.min_x() + margin,
+            rect.min_y() + margin,
+            width - margin * 2.0,
+            height - margin * 2.0,
+        );
+        self.filled_rectangle(layers, 0, canvas, rgba(0.025, 0.035, 0.055, 0.96))?;
+
+        let grid_color = if is_active {
+            rgba(0.13, 0.20, 0.27, 0.38)
+        } else {
+            rgba(0.09, 0.13, 0.18, 0.30)
+        };
+        let grid_gap = 36.0;
+        let mut x = canvas.min_x() + grid_gap;
+        while x < canvas.max_x() {
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(x, canvas.min_y(), 1.0, canvas.height()),
+                grid_color,
+            )?;
+            x += grid_gap;
+        }
+        let mut y = canvas.min_y() + grid_gap;
+        while y < canvas.max_y() {
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(canvas.min_x(), y, canvas.width(), 1.0),
+                grid_color,
+            )?;
+            y += grid_gap;
+        }
+
+        let card_width = (canvas.width() * 0.34).clamp(132.0, 220.0);
+        let card_height = 54.0_f32.min((canvas.height() * 0.32).max(36.0));
+        let canvas_card = euclid::rect(
+            canvas.min_x() + 18.0,
+            canvas.min_y() + 54.0_f32.min(canvas.height() * 0.25),
+            card_width,
+            card_height,
+        );
+        self.paint_h2_graph_card(
+            layers,
+            canvas_card,
+            rgba(0.08, 0.15, 0.22, 0.96),
+            rgba(0.20, 0.68, 0.95, 0.95),
+        )?;
+
+        let visible_nodes = node_count.min(5);
+        if visible_nodes == 0 {
+            return Ok(());
+        }
+
+        let node_x = (canvas.max_x() - card_width - 18.0).max(canvas_card.max_x() + 42.0);
+        let node_gap = if visible_nodes > 1 {
+            ((canvas.height() - card_height - 40.0) / visible_nodes as f32).clamp(58.0, 86.0)
+        } else {
+            0.0
+        };
+        let first_y = canvas.min_y() + 54.0;
+        let edge_color = rgba(0.24, 0.76, 0.88, 0.78);
+        let hub_x = canvas_card.max_x() + 24.0;
+        let canvas_mid_y = canvas_card.min_y() + canvas_card.height() / 2.0;
+
+        if visible_nodes > 1 {
+            let last_node_mid = first_y + (visible_nodes - 1) as f32 * node_gap + card_height / 2.0;
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(
+                    hub_x,
+                    canvas_mid_y.min(last_node_mid),
+                    3.0,
+                    (last_node_mid - canvas_mid_y).abs().max(3.0),
+                ),
+                edge_color,
+            )?;
+        }
+
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(
+                canvas_card.max_x(),
+                canvas_mid_y - 1.5,
+                hub_x - canvas_card.max_x(),
+                3.0,
+            ),
+            edge_color,
+        )?;
+
+        for idx in 0..visible_nodes {
+            let node_y = first_y + idx as f32 * node_gap;
+            let node_rect = euclid::rect(node_x, node_y, card_width, card_height);
+            let node_mid_y = node_rect.min_y() + node_rect.height() / 2.0;
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(hub_x, node_mid_y - 1.5, node_rect.min_x() - hub_x, 3.0),
+                edge_color,
+            )?;
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(node_rect.min_x() - 8.0, node_mid_y - 5.0, 10.0, 10.0),
+                rgba(0.24, 0.76, 0.88, 0.95),
+            )?;
+            self.paint_h2_graph_card(
+                layers,
+                node_rect,
+                rgba(0.07, 0.10, 0.15, 0.96),
+                rgba(0.72, 0.50, 0.18, 0.95),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn paint_h2_graph_card(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        fill: LinearRgba,
+        accent: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let border = rgba(0.34, 0.45, 0.58, 0.82);
+        self.filled_rectangle(layers, 0, rect, fill)?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), rect.min_y(), rect.width(), 2.0),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), rect.max_y() - 2.0, rect.width(), 2.0),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), rect.min_y(), 2.0, rect.height()),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.max_x() - 2.0, rect.min_y(), 2.0, rect.height()),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), rect.min_y(), 6.0, rect.height()),
+            accent,
+        )?;
+        Ok(())
+    }
+
     pub fn build_pane(&mut self, pos: &PositionedPane) -> anyhow::Result<ComputedElement> {
         // First compute the bounds for the pane background
 
@@ -686,4 +876,29 @@ impl crate::TermWindow {
             content: ComputedElementContent::Children(vec![]),
         })
     }
+}
+
+fn h2_metadata_string<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
+    let Value::Object(object) = metadata else {
+        return None;
+    };
+    object
+        .get(&Value::String(key.to_string()))
+        .and_then(|value| match value {
+            Value::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+}
+
+fn h2_metadata_u64(metadata: &Value, key: &str) -> Option<u64> {
+    let Value::Object(object) = metadata else {
+        return None;
+    };
+    object
+        .get(&Value::String(key.to_string()))
+        .and_then(Value::coerce_unsigned)
+}
+
+fn rgba(red: f32, green: f32, blue: f32, alpha: f32) -> LinearRgba {
+    LinearRgba::with_components(red, green, blue, alpha)
 }

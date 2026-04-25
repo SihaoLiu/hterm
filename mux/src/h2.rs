@@ -52,6 +52,7 @@ pub struct H2Pane {
     seqno: AtomicUsize,
     dead: AtomicBool,
     writer_sink: Mutex<Vec<u8>>,
+    graph_node_count: AtomicUsize,
 }
 
 impl H2Pane {
@@ -65,6 +66,7 @@ impl H2Pane {
             seqno: AtomicUsize::new(1),
             dead: AtomicBool::new(false),
             writer_sink: Mutex::new(Vec::new()),
+            graph_node_count: AtomicUsize::new(0),
         });
         pane.rebuild_lines();
         pane
@@ -77,6 +79,11 @@ impl H2Pane {
     pub fn set_lines(&self, lines: Vec<String>) {
         *self.source_lines.lock() = lines;
         self.rebuild_lines();
+    }
+
+    pub fn set_graph_node_count(&self, count: usize) {
+        self.graph_node_count.store(count, Ordering::Relaxed);
+        self.seqno.fetch_add(1, Ordering::Relaxed);
     }
 
     fn rebuild_lines(&self) {
@@ -125,6 +132,10 @@ impl Pane for H2Pane {
                 }
                 .into(),
             ),
+        );
+        obj.insert(
+            Value::String("h2_graph_node_count".into()),
+            Value::U64(self.graph_node_count.load(Ordering::Relaxed) as u64),
         );
         Value::Object(Object::from(obj))
     }

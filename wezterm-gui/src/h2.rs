@@ -109,6 +109,9 @@ fn update_h2_dashboard(snapshot: Value) {
             return;
         };
 
+        panes
+            .graph
+            .set_graph_node_count(graph_node_count_from_snapshot(&snapshot));
         panes.graph.set_lines(graph_lines_from_snapshot(&snapshot));
         panes
             .kanban
@@ -283,6 +286,14 @@ fn graph_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
     }
 
     lines
+}
+
+fn graph_node_count_from_snapshot(snapshot: &Value) -> usize {
+    snapshot
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default()
 }
 
 fn kanban_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
@@ -510,6 +521,18 @@ mod tests {
                 "  (no live agent nodes)".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn graph_node_count_tracks_snapshot_nodes() {
+        let snapshot = serde_json::json!({
+            "nodes": [
+                {"node": "canvas", "runtime": "hterm-local-pane"},
+                {"node": "agent-a", "runtime": "codex"}
+            ]
+        });
+
+        assert_eq!(graph_node_count_from_snapshot(&snapshot), 2);
     }
 
     #[test]
