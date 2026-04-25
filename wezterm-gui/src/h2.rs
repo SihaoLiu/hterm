@@ -244,53 +244,12 @@ fn format_snapshot_status_line(snapshot: &Value) -> String {
 }
 
 fn graph_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
-    let seq = snapshot
-        .get("status")
-        .and_then(|status| status.get("events_seq"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let nodes = snapshot
-        .get("status")
-        .and_then(|status| status.get("registered_nodes"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let mut lines = vec![
-        "H2 Graph View".to_string(),
-        format!("seq {seq}  live nodes {nodes}"),
-        String::new(),
-    ];
-
-    lines.push("[canvas]".to_string());
-
-    let nodes = snapshot
-        .get("nodes")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    if nodes.is_empty() {
-        lines.push("  (no live agent nodes)".to_string());
-        return lines;
-    }
-
-    lines.push("  |".to_string());
-    for item in nodes.iter().take(12) {
-        let node = item
-            .get("node")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let runtime = item
-            .get("runtime")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        lines.push(format!("  +-> [{node}] {runtime}"));
-    }
-
-    lines
+    let _ = snapshot;
+    Vec::new()
 }
 
 fn graph_node_count_from_snapshot(snapshot: &Value) -> usize {
-    snapshot
-        .get("nodes")
+    snapshot.get("graph_nodes")
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or_default()
@@ -489,15 +448,7 @@ mod tests {
 
         assert_eq!(
             graph_lines_from_snapshot(&snapshot),
-            vec![
-                "H2 Graph View".to_string(),
-                "seq 9  live nodes 2".to_string(),
-                "".to_string(),
-                "[canvas]".to_string(),
-                "  |".to_string(),
-                "  +-> [canvas] hterm-local-pane".to_string(),
-                "  +-> [agent-a] codex".to_string()
-            ]
+            Vec::<String>::new()
         );
     }
 
@@ -513,18 +464,12 @@ mod tests {
 
         assert_eq!(
             graph_lines_from_snapshot(&snapshot),
-            vec![
-                "H2 Graph View".to_string(),
-                "seq 10  live nodes 0".to_string(),
-                "".to_string(),
-                "[canvas]".to_string(),
-                "  (no live agent nodes)".to_string()
-            ]
+            Vec::<String>::new()
         );
     }
 
     #[test]
-    fn graph_node_count_tracks_snapshot_nodes() {
+    fn graph_node_count_ignores_runtime_registered_nodes() {
         let snapshot = serde_json::json!({
             "nodes": [
                 {"node": "canvas", "runtime": "hterm-local-pane"},
@@ -532,7 +477,7 @@ mod tests {
             ]
         });
 
-        assert_eq!(graph_node_count_from_snapshot(&snapshot), 2);
+        assert_eq!(graph_node_count_from_snapshot(&snapshot), 0);
     }
 
     #[test]

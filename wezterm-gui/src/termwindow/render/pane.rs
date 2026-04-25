@@ -647,12 +647,21 @@ impl crate::TermWindow {
 
         let card_width = (canvas.width() * 0.34).clamp(132.0, 220.0);
         let card_height = 54.0_f32.min((canvas.height() * 0.32).max(36.0));
-        let canvas_card = euclid::rect(
-            canvas.min_x() + 18.0,
-            canvas.min_y() + 54.0_f32.min(canvas.height() * 0.25),
-            card_width,
-            card_height,
-        );
+        let canvas_card = if node_count == 0 {
+            euclid::rect(
+                canvas.min_x() + (canvas.width() - card_width) / 2.0,
+                canvas.min_y() + (canvas.height() - card_height) / 2.0,
+                card_width,
+                card_height,
+            )
+        } else {
+            euclid::rect(
+                canvas.min_x() + 18.0,
+                canvas.min_y() + 54.0_f32.min(canvas.height() * 0.25),
+                card_width,
+                card_height,
+            )
+        };
         self.paint_h2_graph_card(
             layers,
             canvas_card,
