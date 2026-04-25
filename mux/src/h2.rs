@@ -4,6 +4,7 @@ use crate::pane::{
     Pattern, PerformAssignmentResult, WithPaneLines,
 };
 use crate::renderable::{RenderableDimensions, StableCursorPosition};
+use crate::{Mux, MuxNotification};
 use config::keyassignment::{KeyAssignment, ScrollbackEraseMode};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use rangeset::RangeSet;
@@ -22,11 +23,104 @@ use url::Url;
 use wezterm_dynamic::{Object, Value};
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseEvent, Progress, SemanticZone,
-    StableRowIndex, TerminalConfiguration, TerminalSize,
+    Clipboard, DownloadHandler, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Progress, SemanticZone, StableRowIndex, TerminalConfiguration, TerminalSize,
 };
 
 const SOCKET_ENV: &str = "H2_NODE_SOCKET";
+
+const GRAPH_SCALE_MIN: usize = 500;
+const GRAPH_SCALE_MAX: usize = 2400;
+const GRAPH_SCALE_DEFAULT: usize = 1000;
+const GRAPH_CARD_COLS_DEFAULT: usize = 18;
+const GRAPH_CARD_ROWS_DEFAULT: usize = 4;
+const GRAPH_CARD_COLS_MIN: usize = 10;
+const GRAPH_CARD_ROWS_MIN: usize = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GraphDragMode {
+    Pan,
+    MoveCanvas,
+    ResizeCanvas,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphDragState {
+    mode: GraphDragMode,
+    start_x: isize,
+    start_y: isize,
+    start_pan_x: isize,
+    start_pan_y: isize,
+    start_canvas_x: isize,
+    start_canvas_y: isize,
+    start_canvas_cols: usize,
+    start_canvas_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphViewState {
+    scale_permille: usize,
+    pan_x: isize,
+    pan_y: isize,
+    canvas_x: isize,
+    canvas_y: isize,
+    canvas_cols: usize,
+    canvas_rows: usize,
+    canvas_selected: bool,
+    drag: Option<GraphDragState>,
+}
+
+impl Default for GraphViewState {
+    fn default() -> Self {
+        Self {
+            scale_permille: GRAPH_SCALE_DEFAULT,
+            pan_x: 0,
+            pan_y: 0,
+            canvas_x: -1,
+            canvas_y: -1,
+            canvas_cols: GRAPH_CARD_COLS_DEFAULT,
+            canvas_rows: GRAPH_CARD_ROWS_DEFAULT,
+            canvas_selected: false,
+            drag: None,
+        }
+    }
+}
+
+impl GraphViewState {
+    fn canvas_rect(self, cols: usize, rows: usize) -> (isize, isize, usize, usize) {
+        let canvas_cols = self.canvas_cols.clamp(GRAPH_CARD_COLS_MIN, cols.max(1));
+        let canvas_rows = self.canvas_rows.clamp(GRAPH_CARD_ROWS_MIN, rows.max(1));
+        let default_x = ((cols.saturating_sub(canvas_cols)) / 2) as isize;
+        let default_y = ((rows.saturating_sub(canvas_rows)) / 2) as isize;
+        let x = if self.canvas_x < 0 {
+            default_x
+        } else {
+            self.canvas_x
+        };
+        let y = if self.canvas_y < 0 {
+            default_y
+        } else {
+            self.canvas_y
+        };
+
+        (x + self.pan_x, y + self.pan_y, canvas_cols, canvas_rows)
+    }
+
+    fn hit_canvas(self, cols: usize, rows: usize, x: isize, y: isize) -> Option<GraphDragMode> {
+        let (canvas_x, canvas_y, canvas_cols, canvas_rows) = self.canvas_rect(cols, rows);
+        let canvas_max_x = canvas_x + canvas_cols as isize;
+        let canvas_max_y = canvas_y + canvas_rows as isize;
+        if x < canvas_x || x >= canvas_max_x || y < canvas_y || y >= canvas_max_y {
+            return None;
+        }
+
+        if x >= canvas_max_x.saturating_sub(2) || y >= canvas_max_y.saturating_sub(1) {
+            Some(GraphDragMode::ResizeCanvas)
+        } else {
+            Some(GraphDragMode::MoveCanvas)
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum H2PaneKind {
@@ -53,6 +147,7 @@ pub struct H2Pane {
     dead: AtomicBool,
     writer_sink: Mutex<Vec<u8>>,
     graph_node_count: AtomicUsize,
+    graph_view: Mutex<GraphViewState>,
     kanban_slot_count: AtomicUsize,
     kanban_event_count: AtomicUsize,
     kanban_artifact_count: AtomicUsize,
@@ -70,6 +165,7 @@ impl H2Pane {
             dead: AtomicBool::new(false),
             writer_sink: Mutex::new(Vec::new()),
             graph_node_count: AtomicUsize::new(0),
+            graph_view: Mutex::new(GraphViewState::default()),
             kanban_slot_count: AtomicUsize::new(0),
             kanban_event_count: AtomicUsize::new(0),
             kanban_artifact_count: AtomicUsize::new(0),
@@ -116,6 +212,105 @@ impl H2Pane {
         *self.rendered_lines.lock() = rendered;
         self.seqno.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn notify_output_changed(&self) {
+        self.seqno.fetch_add(1, Ordering::Relaxed);
+        if Mux::try_get().is_some() {
+            Mux::notify_from_any_thread(MuxNotification::PaneOutput(self.pane_id));
+        }
+    }
+
+    fn handle_graph_mouse_event(&self, event: MouseEvent) {
+        let size = *self.size.lock();
+        let mut view = self.graph_view.lock();
+        let x = event.x as isize;
+        let y = event.y as isize;
+        let mut changed = false;
+
+        match (event.kind, event.button) {
+            (MouseEventKind::Press, MouseButton::WheelUp(delta)) => {
+                let amount = 80usize.saturating_mul(delta.max(1));
+                view.scale_permille =
+                    (view.scale_permille + amount).clamp(GRAPH_SCALE_MIN, GRAPH_SCALE_MAX);
+                changed = true;
+            }
+            (MouseEventKind::Press, MouseButton::WheelDown(delta)) => {
+                let amount = 80usize.saturating_mul(delta.max(1));
+                view.scale_permille = view
+                    .scale_permille
+                    .saturating_sub(amount)
+                    .clamp(GRAPH_SCALE_MIN, GRAPH_SCALE_MAX);
+                changed = true;
+            }
+            (MouseEventKind::Press, MouseButton::Left) => {
+                let mode = view
+                    .hit_canvas(size.cols, size.rows, x, y)
+                    .unwrap_or(GraphDragMode::Pan);
+                view.canvas_selected = mode != GraphDragMode::Pan;
+                view.drag = Some(GraphDragState {
+                    mode,
+                    start_x: x,
+                    start_y: y,
+                    start_pan_x: view.pan_x,
+                    start_pan_y: view.pan_y,
+                    start_canvas_x: view.canvas_x,
+                    start_canvas_y: view.canvas_y,
+                    start_canvas_cols: view.canvas_cols,
+                    start_canvas_rows: view.canvas_rows,
+                });
+                changed = true;
+            }
+            (MouseEventKind::Move, MouseButton::Left) => {
+                let Some(drag) = view.drag else {
+                    return;
+                };
+                let dx = x - drag.start_x;
+                let dy = y - drag.start_y;
+                match drag.mode {
+                    GraphDragMode::Pan => {
+                        view.pan_x = drag.start_pan_x + dx;
+                        view.pan_y = drag.start_pan_y + dy;
+                    }
+                    GraphDragMode::MoveCanvas => {
+                        let base_x = if drag.start_canvas_x < 0 {
+                            let (canvas_x, _, _, _) = view.canvas_rect(size.cols, size.rows);
+                            canvas_x - drag.start_pan_x
+                        } else {
+                            drag.start_canvas_x
+                        };
+                        let base_y = if drag.start_canvas_y < 0 {
+                            let (_, canvas_y, _, _) = view.canvas_rect(size.cols, size.rows);
+                            canvas_y - drag.start_pan_y
+                        } else {
+                            drag.start_canvas_y
+                        };
+                        view.canvas_x = base_x + dx;
+                        view.canvas_y = base_y + dy;
+                    }
+                    GraphDragMode::ResizeCanvas => {
+                        view.canvas_cols = (drag.start_canvas_cols as isize + dx)
+                            .max(GRAPH_CARD_COLS_MIN as isize)
+                            as usize;
+                        view.canvas_rows = (drag.start_canvas_rows as isize + dy)
+                            .max(GRAPH_CARD_ROWS_MIN as isize)
+                            as usize;
+                    }
+                }
+                changed = true;
+            }
+            (MouseEventKind::Release, MouseButton::Left) => {
+                if view.drag.take().is_some() {
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+
+        if changed {
+            drop(view);
+            self.notify_output_changed();
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -150,6 +345,39 @@ impl Pane for H2Pane {
         obj.insert(
             Value::String("h2_graph_node_count".into()),
             Value::U64(self.graph_node_count.load(Ordering::Relaxed) as u64),
+        );
+        let graph_view = *self.graph_view.lock();
+        obj.insert(
+            Value::String("h2_graph_scale_permille".into()),
+            Value::U64(graph_view.scale_permille as u64),
+        );
+        obj.insert(
+            Value::String("h2_graph_pan_x".into()),
+            Value::I64(graph_view.pan_x as i64),
+        );
+        obj.insert(
+            Value::String("h2_graph_pan_y".into()),
+            Value::I64(graph_view.pan_y as i64),
+        );
+        obj.insert(
+            Value::String("h2_graph_canvas_x".into()),
+            Value::I64(graph_view.canvas_x as i64),
+        );
+        obj.insert(
+            Value::String("h2_graph_canvas_y".into()),
+            Value::I64(graph_view.canvas_y as i64),
+        );
+        obj.insert(
+            Value::String("h2_graph_canvas_cols".into()),
+            Value::U64(graph_view.canvas_cols as u64),
+        );
+        obj.insert(
+            Value::String("h2_graph_canvas_rows".into()),
+            Value::U64(graph_view.canvas_rows as u64),
+        );
+        obj.insert(
+            Value::String("h2_graph_canvas_selected".into()),
+            Value::Bool(graph_view.canvas_selected),
         );
         obj.insert(
             Value::String("h2_kanban_slot_count".into()),
@@ -278,7 +506,10 @@ impl Pane for H2Pane {
         PerformAssignmentResult::Unhandled
     }
 
-    fn mouse_event(&self, _event: MouseEvent) -> anyhow::Result<()> {
+    fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()> {
+        if self.kind == H2PaneKind::Graph {
+            self.handle_graph_mouse_event(event);
+        }
         Ok(())
     }
 
@@ -499,6 +730,58 @@ fn send_node_rpc(
 mod tests {
     use super::*;
 
+    fn test_size() -> TerminalSize {
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+            dpi: 96,
+        }
+    }
+
+    fn test_mouse(kind: MouseEventKind, button: MouseButton, x: usize, y: usize) -> MouseEvent {
+        MouseEvent {
+            kind,
+            x,
+            y: y as i64,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            button,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn metadata_u64(pane: &H2Pane, key: &str) -> u64 {
+        let Value::Object(object) = pane.get_metadata() else {
+            panic!("metadata is not an object");
+        };
+        object
+            .get(&Value::String(key.to_string()))
+            .and_then(Value::coerce_unsigned)
+            .unwrap_or_else(|| panic!("missing unsigned metadata {key}"))
+    }
+
+    fn metadata_i64(pane: &H2Pane, key: &str) -> i64 {
+        let Value::Object(object) = pane.get_metadata() else {
+            panic!("metadata is not an object");
+        };
+        object
+            .get(&Value::String(key.to_string()))
+            .and_then(Value::coerce_signed)
+            .unwrap_or_else(|| panic!("missing signed metadata {key}"))
+    }
+
+    fn metadata_bool(pane: &H2Pane, key: &str) -> bool {
+        let Value::Object(object) = pane.get_metadata() else {
+            panic!("metadata is not an object");
+        };
+        match object.get(&Value::String(key.to_string())) {
+            Some(Value::Bool(value)) => *value,
+            _ => panic!("missing bool metadata {key}"),
+        }
+    }
+
     #[test]
     fn node_id_for_pane_includes_process_and_pane_identity() {
         let node_id = node_id_for_pane(7);
@@ -528,5 +811,100 @@ mod tests {
         assert_eq!(text, vec!["H2 Kanban", "events: 3", "", ""]);
         assert_eq!(pane.get_title(), "H2 Kanban");
         assert_eq!(pane.get_dimensions().viewport_rows, 4);
+    }
+
+    #[test]
+    fn graph_mouse_wheel_updates_zoom_metadata() {
+        let pane = H2Pane::new(H2PaneKind::Graph, test_size());
+
+        assert_eq!(
+            metadata_u64(&pane, "h2_graph_scale_permille"),
+            GRAPH_SCALE_DEFAULT as u64
+        );
+
+        pane.mouse_event(test_mouse(
+            MouseEventKind::Press,
+            MouseButton::WheelUp(1),
+            40,
+            12,
+        ))
+        .unwrap();
+
+        assert!(metadata_u64(&pane, "h2_graph_scale_permille") > GRAPH_SCALE_DEFAULT as u64);
+    }
+
+    #[test]
+    fn graph_mouse_selects_and_moves_canvas() {
+        let pane = H2Pane::new(H2PaneKind::Graph, test_size());
+        let canvas_x = (80 - GRAPH_CARD_COLS_DEFAULT) / 2;
+        let canvas_y = (24 - GRAPH_CARD_ROWS_DEFAULT) / 2;
+
+        pane.mouse_event(test_mouse(
+            MouseEventKind::Press,
+            MouseButton::Left,
+            canvas_x + 1,
+            canvas_y + 1,
+        ))
+        .unwrap();
+        pane.mouse_event(test_mouse(
+            MouseEventKind::Move,
+            MouseButton::Left,
+            canvas_x + 5,
+            canvas_y + 3,
+        ))
+        .unwrap();
+        pane.mouse_event(test_mouse(
+            MouseEventKind::Release,
+            MouseButton::Left,
+            canvas_x + 5,
+            canvas_y + 3,
+        ))
+        .unwrap();
+
+        assert!(metadata_bool(&pane, "h2_graph_canvas_selected"));
+        assert!(metadata_i64(&pane, "h2_graph_canvas_x") >= canvas_x as i64 + 4);
+        assert!(metadata_i64(&pane, "h2_graph_canvas_y") >= canvas_y as i64 + 2);
+    }
+
+    #[test]
+    fn graph_mouse_pans_background_and_resizes_canvas() {
+        let pane = H2Pane::new(H2PaneKind::Graph, test_size());
+        let canvas_x = (80 - GRAPH_CARD_COLS_DEFAULT) / 2;
+        let canvas_y = (24 - GRAPH_CARD_ROWS_DEFAULT) / 2;
+
+        pane.mouse_event(test_mouse(MouseEventKind::Press, MouseButton::Left, 1, 1))
+            .unwrap();
+        pane.mouse_event(test_mouse(MouseEventKind::Move, MouseButton::Left, 4, 3))
+            .unwrap();
+        pane.mouse_event(test_mouse(MouseEventKind::Release, MouseButton::Left, 4, 3))
+            .unwrap();
+
+        assert_eq!(metadata_i64(&pane, "h2_graph_pan_x"), 3);
+        assert_eq!(metadata_i64(&pane, "h2_graph_pan_y"), 2);
+
+        pane.mouse_event(test_mouse(
+            MouseEventKind::Press,
+            MouseButton::Left,
+            canvas_x + GRAPH_CARD_COLS_DEFAULT - 1 + 3,
+            canvas_y + GRAPH_CARD_ROWS_DEFAULT - 1 + 2,
+        ))
+        .unwrap();
+        pane.mouse_event(test_mouse(
+            MouseEventKind::Move,
+            MouseButton::Left,
+            canvas_x + GRAPH_CARD_COLS_DEFAULT + 4 + 3,
+            canvas_y + GRAPH_CARD_ROWS_DEFAULT + 2 + 2,
+        ))
+        .unwrap();
+        pane.mouse_event(test_mouse(
+            MouseEventKind::Release,
+            MouseButton::Left,
+            canvas_x + GRAPH_CARD_COLS_DEFAULT + 4 + 3,
+            canvas_y + GRAPH_CARD_ROWS_DEFAULT + 2 + 2,
+        ))
+        .unwrap();
+
+        assert!(metadata_u64(&pane, "h2_graph_canvas_cols") >= 22);
+        assert!(metadata_u64(&pane, "h2_graph_canvas_rows") >= 6);
     }
 }

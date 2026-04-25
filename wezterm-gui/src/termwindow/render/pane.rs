@@ -20,6 +20,19 @@ use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct H2GraphRenderState {
+    node_count: usize,
+    scale_permille: usize,
+    pan_x: isize,
+    pan_y: isize,
+    canvas_x: isize,
+    canvas_y: isize,
+    canvas_cols: usize,
+    canvas_rows: usize,
+    canvas_selected: bool,
+}
+
 impl crate::TermWindow {
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
         let computed = self.build_pane(pos)?;
@@ -181,15 +194,28 @@ impl crate::TermWindow {
         let h2_metadata = pos.pane.get_metadata();
         match h2_metadata_string(&h2_metadata, "h2_pane_kind") {
             Some("graph") => {
-                let graph_node_count = h2_metadata_u64(&h2_metadata, "h2_graph_node_count")
-                    .unwrap_or_default() as usize;
-                self.paint_h2_graph_canvas(
-                    layers,
-                    pane_content_rect,
-                    graph_node_count,
-                    pos.is_active,
-                )
-                .context("paint_h2_graph_canvas")?;
+                let graph = H2GraphRenderState {
+                    node_count: h2_metadata_u64(&h2_metadata, "h2_graph_node_count")
+                        .unwrap_or_default() as usize,
+                    scale_permille: h2_metadata_u64(&h2_metadata, "h2_graph_scale_permille")
+                        .unwrap_or(1000) as usize,
+                    pan_x: h2_metadata_i64(&h2_metadata, "h2_graph_pan_x").unwrap_or_default()
+                        as isize,
+                    pan_y: h2_metadata_i64(&h2_metadata, "h2_graph_pan_y").unwrap_or_default()
+                        as isize,
+                    canvas_x: h2_metadata_i64(&h2_metadata, "h2_graph_canvas_x").unwrap_or(-1)
+                        as isize,
+                    canvas_y: h2_metadata_i64(&h2_metadata, "h2_graph_canvas_y").unwrap_or(-1)
+                        as isize,
+                    canvas_cols: h2_metadata_u64(&h2_metadata, "h2_graph_canvas_cols").unwrap_or(18)
+                        as usize,
+                    canvas_rows: h2_metadata_u64(&h2_metadata, "h2_graph_canvas_rows").unwrap_or(4)
+                        as usize,
+                    canvas_selected: h2_metadata_bool(&h2_metadata, "h2_graph_canvas_selected")
+                        .unwrap_or(false),
+                };
+                self.paint_h2_graph_canvas(layers, pane_content_rect, graph, pos.is_active)
+                    .context("paint_h2_graph_canvas")?;
             }
             Some("kanban") => {
                 let slot_count = h2_metadata_u64(&h2_metadata, "h2_kanban_slot_count")
@@ -610,6 +636,11 @@ impl crate::TermWindow {
             }
         }
 
+        if let Some(title) = h2_pane_title(&h2_metadata) {
+            self.paint_h2_title_badge(layers, pane_content_rect, title, pos.is_active)
+                .context("paint_h2_title_badge")?;
+        }
+
         /*
         if let Some(zone) = zone {
             // TODO: render a thingy to jump to prior prompt
@@ -625,7 +656,7 @@ impl crate::TermWindow {
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         rect: RectF,
-        node_count: usize,
+        graph: H2GraphRenderState,
         is_active: bool,
     ) -> anyhow::Result<()> {
         let width = rect.width().max(1.0);
@@ -670,31 +701,37 @@ impl crate::TermWindow {
             y += grid_gap;
         }
 
-        let card_width = (canvas.width() * 0.34).clamp(132.0, 220.0);
-        let card_height = 54.0_f32.min((canvas.height() * 0.32).max(36.0));
-        let canvas_card = if node_count == 0 {
-            euclid::rect(
-                canvas.min_x() + (canvas.width() - card_width) / 2.0,
-                canvas.min_y() + (canvas.height() - card_height) / 2.0,
-                card_width,
-                card_height,
-            )
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        let scale = (graph.scale_permille as f32 / 1000.0).clamp(0.5, 2.4);
+        let card_width = (graph.canvas_cols.max(1) as f32 * cell_width * scale)
+            .clamp(90.0, (canvas.width() * 0.78).max(90.0));
+        let card_height = (graph.canvas_rows.max(1) as f32 * cell_height * scale)
+            .clamp(34.0, (canvas.height() * 0.55).max(34.0));
+        let default_x = canvas.min_x() + (canvas.width() - card_width) / 2.0;
+        let default_y = canvas.min_y() + (canvas.height() - card_height) / 2.0;
+        let card_x = if graph.canvas_x < 0 {
+            default_x
         } else {
-            euclid::rect(
-                canvas.min_x() + 18.0,
-                canvas.min_y() + 54.0_f32.min(canvas.height() * 0.25),
-                card_width,
-                card_height,
-            )
-        };
+            canvas.min_x() + graph.canvas_x as f32 * cell_width * scale
+        } + graph.pan_x as f32 * cell_width;
+        let card_y = if graph.canvas_y < 0 {
+            default_y
+        } else {
+            canvas.min_y() + graph.canvas_y as f32 * cell_height * scale
+        } + graph.pan_y as f32 * cell_height;
+        let canvas_card = euclid::rect(card_x, card_y, card_width, card_height);
         self.paint_h2_graph_card(
             layers,
             canvas_card,
             rgba(0.08, 0.15, 0.22, 0.96),
             rgba(0.20, 0.68, 0.95, 0.95),
         )?;
+        if graph.canvas_selected {
+            self.paint_h2_selection_frame(layers, canvas_card, rgba(0.43, 0.88, 1.0, 0.95))?;
+        }
 
-        let visible_nodes = node_count.min(5);
+        let visible_nodes = graph.node_count.min(5);
         if visible_nodes == 0 {
             return Ok(());
         }
@@ -806,6 +843,61 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    fn paint_h2_selection_frame(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let thickness = 3.0;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(
+                rect.min_x() - thickness,
+                rect.min_y() - thickness,
+                rect.width() + thickness * 2.0,
+                thickness,
+            ),
+            color,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(
+                rect.min_x() - thickness,
+                rect.max_y(),
+                rect.width() + thickness * 2.0,
+                thickness,
+            ),
+            color,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(
+                rect.min_x() - thickness,
+                rect.min_y(),
+                thickness,
+                rect.height(),
+            ),
+            color,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.max_x(), rect.min_y(), thickness, rect.height()),
+            color,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.max_x() - 8.0, rect.max_y() - 8.0, 10.0, 10.0),
+            color,
+        )?;
+        Ok(())
+    }
+
     fn paint_h2_kanban_board(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
@@ -877,18 +969,21 @@ impl crate::TermWindow {
             if content.width() >= 520.0 && content.height() >= 70.0 {
                 let gap = 8.0;
                 let card_width = ((content.width() - gap * 2.0) / 3.0).max(1.0);
-                for (idx, (count, fill, accent)) in [
+                for (idx, (title, count, fill, accent)) in [
                     (
+                        "Slots",
                         slot_count,
                         rgba(0.055, 0.092, 0.105, 0.96),
                         rgba(0.26, 0.78, 0.76, 0.95),
                     ),
                     (
+                        "Events",
                         event_count,
                         rgba(0.075, 0.070, 0.105, 0.96),
                         rgba(0.54, 0.48, 0.88, 0.95),
                     ),
                     (
+                        "Artifacts",
                         artifact_count,
                         rgba(0.098, 0.078, 0.052, 0.96),
                         rgba(0.86, 0.63, 0.30, 0.95),
@@ -905,22 +1000,26 @@ impl crate::TermWindow {
                         content.height(),
                     );
                     self.paint_h2_kanban_card(layers, card, fill, accent, count, max_count)?;
+                    self.paint_h2_kanban_card_title(card, title, count, accent)?;
                 }
             } else {
                 let gap = 8.0;
                 let card_height = ((content.height() - gap * 2.0) / 3.0).max(1.0);
-                for (idx, (count, fill, accent)) in [
+                for (idx, (title, count, fill, accent)) in [
                     (
+                        "Slots",
                         slot_count,
                         rgba(0.055, 0.092, 0.105, 0.96),
                         rgba(0.26, 0.78, 0.76, 0.95),
                     ),
                     (
+                        "Events",
                         event_count,
                         rgba(0.075, 0.070, 0.105, 0.96),
                         rgba(0.54, 0.48, 0.88, 0.95),
                     ),
                     (
+                        "Artifacts",
                         artifact_count,
                         rgba(0.098, 0.078, 0.052, 0.96),
                         rgba(0.86, 0.63, 0.30, 0.95),
@@ -937,6 +1036,7 @@ impl crate::TermWindow {
                         card_height,
                     );
                     self.paint_h2_kanban_card(layers, card, fill, accent, count, max_count)?;
+                    self.paint_h2_kanban_card_title(card, title, count, accent)?;
                 }
             }
         }
@@ -1015,6 +1115,27 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    fn paint_h2_kanban_card_title(
+        &mut self,
+        rect: RectF,
+        title: &str,
+        count: usize,
+        accent: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if rect.width() < 48.0 || rect.height() < 24.0 {
+            return Ok(());
+        }
+
+        let text = format!("{title} {count}");
+        self.paint_h2_text_label(
+            &text,
+            rect.min_x() + 16.0,
+            rect.min_y() + 8.0,
+            (rect.width() - 24.0).max(1.0),
+            accent,
+        )
+    }
+
     fn paint_h2_kanban_timeline(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -1059,6 +1180,112 @@ impl crate::TermWindow {
         }
 
         Ok(())
+    }
+
+    fn paint_h2_title_badge(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        title: &str,
+        is_active: bool,
+    ) -> anyhow::Result<()> {
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        let text = format!("-- {title} --");
+        let badge_width = (text.chars().count() as f32 * cell_width * 0.72 + 24.0).max(88.0);
+        let badge_height = (cell_height + 10.0).max(24.0);
+        let badge = euclid::rect(
+            rect.min_x() + 10.0,
+            rect.min_y() + 8.0,
+            badge_width.min((rect.width() - 20.0).max(1.0)),
+            badge_height,
+        );
+        let fill = if is_active {
+            rgba(0.055, 0.070, 0.088, 0.96)
+        } else {
+            rgba(0.040, 0.048, 0.060, 0.92)
+        };
+        let border = rgba(0.36, 0.48, 0.62, 0.86);
+        self.filled_rectangle(layers, 0, badge, fill)?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(badge.min_x(), badge.min_y(), badge.width(), 1.0),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(badge.min_x(), badge.max_y() - 1.0, badge.width(), 1.0),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(badge.min_x(), badge.min_y(), 1.0, badge.height()),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(badge.max_x() - 1.0, badge.min_y(), 1.0, badge.height()),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(badge.min_x(), badge.min_y(), 4.0, badge.height()),
+            rgba(0.34, 0.72, 0.92, 0.95),
+        )?;
+
+        self.paint_h2_text_label(
+            &text,
+            badge.min_x() + 12.0,
+            badge.min_y() + 5.0,
+            (badge.width() - 18.0).max(1.0),
+            rgba(0.78, 0.86, 0.92, 0.98),
+        )
+    }
+
+    fn paint_h2_text_label(
+        &mut self,
+        text: &str,
+        left: f32,
+        top: f32,
+        width: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let gl_state = self.render_state.as_ref().unwrap();
+        let font = self.fonts.default_font()?;
+        let element =
+            Element::new(&font, ElementContent::Text(text.to_string())).colors(ElementColors {
+                border: BorderColor::default(),
+                bg: InheritableColor::Inherited,
+                text: color.into(),
+            });
+        let context = LayoutContext {
+            width: config::DimensionContext {
+                dpi: self.dimensions.dpi as f32,
+                pixel_max: self.dimensions.pixel_width as f32,
+                pixel_cell: self.render_metrics.cell_size.width as f32,
+            },
+            height: config::DimensionContext {
+                dpi: self.dimensions.dpi as f32,
+                pixel_max: self.dimensions.pixel_height as f32,
+                pixel_cell: self.render_metrics.cell_size.height as f32,
+            },
+            bounds: euclid::rect(
+                left,
+                top,
+                width,
+                (self.render_metrics.cell_size.height as f32 + 4.0).max(1.0),
+            ),
+            metrics: &self.render_metrics,
+            gl_state,
+            zindex: 10,
+        };
+        let computed = self.compute_element(&context, &element)?;
+        self.render_element(&computed, gl_state, None)
     }
 
     pub fn build_pane(&mut self, pos: &PositionedPane) -> anyhow::Result<ComputedElement> {
@@ -1188,6 +1415,84 @@ fn h2_metadata_u64(metadata: &Value, key: &str) -> Option<u64> {
         .and_then(Value::coerce_unsigned)
 }
 
+fn h2_metadata_i64(metadata: &Value, key: &str) -> Option<i64> {
+    let Value::Object(object) = metadata else {
+        return None;
+    };
+    object
+        .get(&Value::String(key.to_string()))
+        .and_then(Value::coerce_signed)
+}
+
+fn h2_metadata_bool(metadata: &Value, key: &str) -> Option<bool> {
+    let Value::Object(object) = metadata else {
+        return None;
+    };
+    match object.get(&Value::String(key.to_string())) {
+        Some(Value::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn h2_pane_title(metadata: &Value) -> Option<&'static str> {
+    match h2_metadata_string(metadata, "h2_pane_kind") {
+        Some("graph") => Some("Graph"),
+        Some("kanban") => Some("Kanban"),
+        _ if std::env::var_os("H2_NODE_SOCKET").is_some()
+            && h2_metadata_string(metadata, "h2_node_id").is_some() =>
+        {
+            Some("Terminal")
+        }
+        _ => None,
+    }
+}
+
 fn rgba(red: f32, green: f32, blue: f32, alpha: f32) -> LinearRgba {
     LinearRgba::with_components(red, green, blue, alpha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use wezterm_dynamic::Object;
+
+    fn metadata(values: &[(&str, Value)]) -> Value {
+        let object = values
+            .iter()
+            .map(|(key, value)| (Value::String((*key).to_string()), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        Value::Object(Object::from(object))
+    }
+
+    #[test]
+    fn h2_pane_title_uses_explicit_h2_kind() {
+        assert_eq!(
+            h2_pane_title(&metadata(&[(
+                "h2_pane_kind",
+                Value::String("graph".to_string())
+            )])),
+            Some("Graph")
+        );
+        assert_eq!(
+            h2_pane_title(&metadata(&[(
+                "h2_pane_kind",
+                Value::String("kanban".to_string())
+            )])),
+            Some("Kanban")
+        );
+    }
+
+    #[test]
+    fn h2_metadata_helpers_read_signed_and_bool_values() {
+        let metadata = metadata(&[
+            ("signed", Value::I64(-3)),
+            ("flag", Value::Bool(true)),
+            ("unsigned", Value::U64(9)),
+        ]);
+
+        assert_eq!(h2_metadata_i64(&metadata, "signed"), Some(-3));
+        assert_eq!(h2_metadata_bool(&metadata, "flag"), Some(true));
+        assert_eq!(h2_metadata_u64(&metadata, "unsigned"), Some(9));
+    }
 }
