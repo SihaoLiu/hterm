@@ -257,18 +257,29 @@ fn graph_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
         String::new(),
     ];
 
-    if let Some(items) = snapshot.get("nodes").and_then(Value::as_array) {
-        for item in items.iter().take(12) {
-            let node = item
-                .get("node")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let runtime = item
-                .get("runtime")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            lines.push(format!("{node}  {runtime}"));
-        }
+    lines.push("[canvas]".to_string());
+
+    let nodes = snapshot
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if nodes.is_empty() {
+        lines.push("  (no live agent nodes)".to_string());
+        return lines;
+    }
+
+    lines.push("  |".to_string());
+    for item in nodes.iter().take(12) {
+        let node = item
+            .get("node")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let runtime = item
+            .get("runtime")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        lines.push(format!("  +-> [{node}] {runtime}"));
     }
 
     lines
@@ -471,8 +482,32 @@ mod tests {
                 "H2 Graph View".to_string(),
                 "seq 9  live nodes 2".to_string(),
                 "".to_string(),
-                "canvas  hterm-local-pane".to_string(),
-                "agent-a  codex".to_string()
+                "[canvas]".to_string(),
+                "  |".to_string(),
+                "  +-> [canvas] hterm-local-pane".to_string(),
+                "  +-> [agent-a] codex".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn graph_lines_show_canvas_for_empty_graph() {
+        let snapshot = serde_json::json!({
+            "status": {
+                "events_seq": 10,
+                "registered_nodes": 0
+            },
+            "nodes": []
+        });
+
+        assert_eq!(
+            graph_lines_from_snapshot(&snapshot),
+            vec![
+                "H2 Graph View".to_string(),
+                "seq 10  live nodes 0".to_string(),
+                "".to_string(),
+                "[canvas]".to_string(),
+                "  (no live agent nodes)".to_string()
             ]
         );
     }
