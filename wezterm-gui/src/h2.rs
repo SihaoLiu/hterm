@@ -1,35 +1,51 @@
 use crate::termwindow::TermWindowNotif;
 use anyhow::{anyhow, Context};
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::Duration;
 use window::WindowOps;
 
-const SOCKET_ENV: &str = "H2_NODE_SOCKET";
+const UI_SOCKET_ENV: &str = "H2_UI_SOCKET";
+const NODE_SOCKET_ENV: &str = "H2_NODE_SOCKET";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 static STATUS_BRIDGE: Once = Once::new();
 
 pub fn maybe_start_status_bridge() {
-    let Some(socket_path) = std::env::var_os(SOCKET_ENV).filter(|value| !value.is_empty()) else {
+    let socket_paths = status_socket_paths_from_values(
+        std::env::var_os(UI_SOCKET_ENV),
+        std::env::var_os(NODE_SOCKET_ENV),
+    );
+    if socket_paths.is_empty() {
         return;
-    };
-    let socket_path = PathBuf::from(socket_path);
+    }
 
     STATUS_BRIDGE.call_once(move || {
         if let Err(err) = std::thread::Builder::new()
             .name("h2-status-bridge".to_string())
-            .spawn(move || run_status_bridge(socket_path))
+            .spawn(move || run_status_bridge(socket_paths))
         {
             log::warn!("failed to start h2 status bridge: {err:#}");
         }
     });
 }
 
-fn run_status_bridge(socket_path: PathBuf) {
+fn status_socket_paths_from_values(
+    ui_socket: Option<OsString>,
+    node_socket: Option<OsString>,
+) -> Vec<PathBuf> {
+    IntoIterator::into_iter([ui_socket, node_socket])
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn run_status_bridge(socket_paths: Vec<PathBuf>) {
     loop {
-        let status_line = match poll_status_line(&socket_path) {
+        let status_line = match poll_status_line(&socket_paths) {
             Ok(line) => line,
             Err(err) => {
                 log::trace!("h2 status bridge poll failed: {err:#}");
@@ -49,19 +65,28 @@ fn poll_interval_ms() -> u64 {
         .unwrap_or(DEFAULT_POLL_INTERVAL_MS)
 }
 
-fn poll_status_line(socket_path: &Path) -> anyhow::Result<String> {
-    let snapshot = send_rpc(
-        socket_path,
-        "ui_snapshot",
-        json!({
-            "from_seq": 0,
-            "event_limit": 5,
-            "artifact_limit": 3
-        }),
-    )
-    .context("ui_snapshot")?;
+fn poll_status_line(socket_paths: &[PathBuf]) -> anyhow::Result<String> {
+    let mut last_error = None;
+    for socket_path in socket_paths {
+        match send_rpc(
+            socket_path,
+            "ui_snapshot",
+            json!({
+                "from_seq": 0,
+                "event_limit": 5,
+                "artifact_limit": 3
+            }),
+        )
+        .context("ui_snapshot")
+        {
+            Ok(snapshot) => return Ok(format_snapshot_status_line(&snapshot)),
+            Err(err) => {
+                last_error = Some(err);
+            }
+        }
+    }
 
-    Ok(format_snapshot_status_line(&snapshot))
+    Err(last_error.unwrap_or_else(|| anyhow!("no h2 socket candidates")))
 }
 
 fn set_right_status(status: String) {
@@ -180,5 +205,29 @@ mod tests {
             format_snapshot_status_line(&snapshot),
             "H2 seq=52 nodes=4 artifacts=7 last=trace_log"
         );
+    }
+
+    #[test]
+    fn status_bridge_orders_ui_socket_before_node_socket() {
+        let chosen = status_socket_paths_from_values(
+            Some("temp/h2-runtime/ui.sock".into()),
+            Some("temp/h2-runtime/node.sock".into()),
+        );
+
+        assert_eq!(
+            chosen,
+            vec![
+                PathBuf::from("temp/h2-runtime/ui.sock"),
+                PathBuf::from("temp/h2-runtime/node.sock")
+            ]
+        );
+    }
+
+    #[test]
+    fn status_bridge_falls_back_to_node_socket() {
+        let chosen =
+            status_socket_paths_from_values(None, Some("temp/h2-runtime/node.sock".into()));
+
+        assert_eq!(chosen, vec![PathBuf::from("temp/h2-runtime/node.sock")]);
     }
 }
