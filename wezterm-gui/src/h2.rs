@@ -113,6 +113,10 @@ fn update_h2_dashboard(snapshot: Value) {
             .graph
             .set_graph_node_count(graph_node_count_from_snapshot(&snapshot));
         panes.graph.set_lines(graph_lines_from_snapshot(&snapshot));
+        let (slot_count, event_count, artifact_count) = kanban_counts_from_snapshot(&snapshot);
+        panes
+            .kanban
+            .set_kanban_counts(slot_count, event_count, artifact_count);
         panes
             .kanban
             .set_lines(kanban_lines_from_snapshot(&snapshot));
@@ -249,10 +253,37 @@ fn graph_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
 }
 
 fn graph_node_count_from_snapshot(snapshot: &Value) -> usize {
-    snapshot.get("graph_nodes")
+    snapshot
+        .get("graph_nodes")
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or_default()
+}
+
+fn kanban_counts_from_snapshot(snapshot: &Value) -> (usize, usize, usize) {
+    let slot_count = snapshot
+        .get("slots")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let event_count = snapshot
+        .get("events")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let artifact_count = snapshot
+        .get("artifact_count")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .or_else(|| {
+            snapshot
+                .get("artifacts")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or_default();
+
+    (slot_count, event_count, artifact_count)
 }
 
 fn kanban_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
@@ -446,10 +477,7 @@ mod tests {
             ]
         });
 
-        assert_eq!(
-            graph_lines_from_snapshot(&snapshot),
-            Vec::<String>::new()
-        );
+        assert_eq!(graph_lines_from_snapshot(&snapshot), Vec::<String>::new());
     }
 
     #[test]
@@ -462,10 +490,7 @@ mod tests {
             "nodes": []
         });
 
-        assert_eq!(
-            graph_lines_from_snapshot(&snapshot),
-            Vec::<String>::new()
-        );
+        assert_eq!(graph_lines_from_snapshot(&snapshot), Vec::<String>::new());
     }
 
     #[test]
@@ -478,6 +503,40 @@ mod tests {
         });
 
         assert_eq!(graph_node_count_from_snapshot(&snapshot), 0);
+    }
+
+    #[test]
+    fn kanban_counts_use_slots_events_and_artifacts() {
+        let snapshot = serde_json::json!({
+            "slots": [
+                {"slot": {"node": "canvas", "name": "brief"}},
+                {"slot": {"node": "canvas", "name": "decision"}}
+            ],
+            "events": [
+                {"seq": 10, "type": "daemon_started"},
+                {"seq": 11, "type": "artifact_emitted"},
+                {"seq": 12, "type": "slot_advanced"}
+            ],
+            "artifact_count": 5,
+            "artifacts": [
+                {"seq": 11, "kind": "text"}
+            ]
+        });
+
+        assert_eq!(kanban_counts_from_snapshot(&snapshot), (2, 3, 5));
+    }
+
+    #[test]
+    fn kanban_counts_fall_back_to_visible_artifacts() {
+        let snapshot = serde_json::json!({
+            "events": [],
+            "artifacts": [
+                {"seq": 1, "kind": "text"},
+                {"seq": 2, "kind": "decision"}
+            ]
+        });
+
+        assert_eq!(kanban_counts_from_snapshot(&snapshot), (0, 0, 2));
     }
 
     #[test]

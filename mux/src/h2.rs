@@ -53,6 +53,9 @@ pub struct H2Pane {
     dead: AtomicBool,
     writer_sink: Mutex<Vec<u8>>,
     graph_node_count: AtomicUsize,
+    kanban_slot_count: AtomicUsize,
+    kanban_event_count: AtomicUsize,
+    kanban_artifact_count: AtomicUsize,
 }
 
 impl H2Pane {
@@ -67,6 +70,9 @@ impl H2Pane {
             dead: AtomicBool::new(false),
             writer_sink: Mutex::new(Vec::new()),
             graph_node_count: AtomicUsize::new(0),
+            kanban_slot_count: AtomicUsize::new(0),
+            kanban_event_count: AtomicUsize::new(0),
+            kanban_artifact_count: AtomicUsize::new(0),
         });
         pane.rebuild_lines();
         pane
@@ -83,6 +89,14 @@ impl H2Pane {
 
     pub fn set_graph_node_count(&self, count: usize) {
         self.graph_node_count.store(count, Ordering::Relaxed);
+        self.seqno.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_kanban_counts(&self, slots: usize, events: usize, artifacts: usize) {
+        self.kanban_slot_count.store(slots, Ordering::Relaxed);
+        self.kanban_event_count.store(events, Ordering::Relaxed);
+        self.kanban_artifact_count
+            .store(artifacts, Ordering::Relaxed);
         self.seqno.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -136,6 +150,18 @@ impl Pane for H2Pane {
         obj.insert(
             Value::String("h2_graph_node_count".into()),
             Value::U64(self.graph_node_count.load(Ordering::Relaxed) as u64),
+        );
+        obj.insert(
+            Value::String("h2_kanban_slot_count".into()),
+            Value::U64(self.kanban_slot_count.load(Ordering::Relaxed) as u64),
+        );
+        obj.insert(
+            Value::String("h2_kanban_event_count".into()),
+            Value::U64(self.kanban_event_count.load(Ordering::Relaxed) as u64),
+        );
+        obj.insert(
+            Value::String("h2_kanban_artifact_count".into()),
+            Value::U64(self.kanban_artifact_count.load(Ordering::Relaxed) as u64),
         );
         Value::Object(Object::from(obj))
     }

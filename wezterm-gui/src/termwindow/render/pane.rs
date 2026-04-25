@@ -179,11 +179,36 @@ impl crate::TermWindow {
             pos.height as f32 * cell_height,
         );
         let h2_metadata = pos.pane.get_metadata();
-        if h2_metadata_string(&h2_metadata, "h2_pane_kind") == Some("graph") {
-            let graph_node_count =
-                h2_metadata_u64(&h2_metadata, "h2_graph_node_count").unwrap_or_default() as usize;
-            self.paint_h2_graph_canvas(layers, pane_content_rect, graph_node_count, pos.is_active)
+        match h2_metadata_string(&h2_metadata, "h2_pane_kind") {
+            Some("graph") => {
+                let graph_node_count = h2_metadata_u64(&h2_metadata, "h2_graph_node_count")
+                    .unwrap_or_default() as usize;
+                self.paint_h2_graph_canvas(
+                    layers,
+                    pane_content_rect,
+                    graph_node_count,
+                    pos.is_active,
+                )
                 .context("paint_h2_graph_canvas")?;
+            }
+            Some("kanban") => {
+                let slot_count = h2_metadata_u64(&h2_metadata, "h2_kanban_slot_count")
+                    .unwrap_or_default() as usize;
+                let event_count = h2_metadata_u64(&h2_metadata, "h2_kanban_event_count")
+                    .unwrap_or_default() as usize;
+                let artifact_count = h2_metadata_u64(&h2_metadata, "h2_kanban_artifact_count")
+                    .unwrap_or_default() as usize;
+                self.paint_h2_kanban_board(
+                    layers,
+                    pane_content_rect,
+                    slot_count,
+                    event_count,
+                    artifact_count,
+                    pos.is_active,
+                )
+                .context("paint_h2_kanban_board")?;
+            }
+            _ => {}
         }
 
         {
@@ -778,6 +803,261 @@ impl crate::TermWindow {
             euclid::rect(rect.min_x(), rect.min_y(), 6.0, rect.height()),
             accent,
         )?;
+        Ok(())
+    }
+
+    fn paint_h2_kanban_board(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        slot_count: usize,
+        event_count: usize,
+        artifact_count: usize,
+        is_active: bool,
+    ) -> anyhow::Result<()> {
+        let width = rect.width().max(1.0);
+        let height = rect.height().max(1.0);
+        let margin = 8.0;
+        if width <= margin * 2.0 || height <= margin * 2.0 {
+            return Ok(());
+        }
+
+        let board = euclid::rect(
+            rect.min_x() + margin,
+            rect.min_y() + margin,
+            width - margin * 2.0,
+            height - margin * 2.0,
+        );
+        self.filled_rectangle(layers, 0, board, rgba(0.026, 0.029, 0.038, 0.97))?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(board.min_x(), board.min_y(), board.width(), 2.0),
+            rgba(0.30, 0.39, 0.52, 0.82),
+        )?;
+
+        let header_height = if board.height() >= 150.0 {
+            44.0
+        } else {
+            (board.height() * 0.24).clamp(22.0, 34.0)
+        };
+        let header = euclid::rect(
+            board.min_x() + 8.0,
+            board.min_y() + 8.0,
+            (board.width() - 16.0).max(1.0),
+            header_height.min((board.height() - 16.0).max(1.0)),
+        );
+        self.filled_rectangle(layers, 0, header, rgba(0.055, 0.072, 0.095, 0.96))?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(header.min_x(), header.min_y(), 4.0, header.height()),
+            rgba(0.36, 0.68, 0.86, 0.95),
+        )?;
+        if is_active {
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(header.min_x(), header.max_y() - 2.0, header.width(), 2.0),
+                rgba(0.23, 0.42, 0.58, 0.70),
+            )?;
+        }
+
+        let content_top = header.max_y() + 8.0;
+        let timeline_height = if board.height() >= 190.0 { 30.0 } else { 0.0 };
+        let content_bottom = board.max_y() - 8.0 - timeline_height;
+        if content_bottom > content_top + 18.0 {
+            let content: RectF = euclid::rect(
+                board.min_x() + 8.0,
+                content_top,
+                (board.width() - 16.0).max(1.0),
+                content_bottom - content_top,
+            );
+            let max_count = slot_count.max(event_count).max(artifact_count).max(1);
+            if content.width() >= 520.0 && content.height() >= 70.0 {
+                let gap = 8.0;
+                let card_width = ((content.width() - gap * 2.0) / 3.0).max(1.0);
+                for (idx, (count, fill, accent)) in [
+                    (
+                        slot_count,
+                        rgba(0.055, 0.092, 0.105, 0.96),
+                        rgba(0.26, 0.78, 0.76, 0.95),
+                    ),
+                    (
+                        event_count,
+                        rgba(0.075, 0.070, 0.105, 0.96),
+                        rgba(0.54, 0.48, 0.88, 0.95),
+                    ),
+                    (
+                        artifact_count,
+                        rgba(0.098, 0.078, 0.052, 0.96),
+                        rgba(0.86, 0.63, 0.30, 0.95),
+                    ),
+                ]
+                .iter()
+                .copied()
+                .enumerate()
+                {
+                    let card = euclid::rect(
+                        content.min_x() + idx as f32 * (card_width + gap),
+                        content.min_y(),
+                        card_width,
+                        content.height(),
+                    );
+                    self.paint_h2_kanban_card(layers, card, fill, accent, count, max_count)?;
+                }
+            } else {
+                let gap = 8.0;
+                let card_height = ((content.height() - gap * 2.0) / 3.0).max(1.0);
+                for (idx, (count, fill, accent)) in [
+                    (
+                        slot_count,
+                        rgba(0.055, 0.092, 0.105, 0.96),
+                        rgba(0.26, 0.78, 0.76, 0.95),
+                    ),
+                    (
+                        event_count,
+                        rgba(0.075, 0.070, 0.105, 0.96),
+                        rgba(0.54, 0.48, 0.88, 0.95),
+                    ),
+                    (
+                        artifact_count,
+                        rgba(0.098, 0.078, 0.052, 0.96),
+                        rgba(0.86, 0.63, 0.30, 0.95),
+                    ),
+                ]
+                .iter()
+                .copied()
+                .enumerate()
+                {
+                    let card = euclid::rect(
+                        content.min_x(),
+                        content.min_y() + idx as f32 * (card_height + gap),
+                        content.width(),
+                        card_height,
+                    );
+                    self.paint_h2_kanban_card(layers, card, fill, accent, count, max_count)?;
+                }
+            }
+        }
+
+        if timeline_height > 0.0 {
+            self.paint_h2_kanban_timeline(
+                layers,
+                euclid::rect(
+                    board.min_x() + 18.0,
+                    board.max_y() - timeline_height,
+                    (board.width() - 36.0).max(1.0),
+                    timeline_height - 8.0,
+                ),
+                slot_count,
+                event_count,
+                artifact_count,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn paint_h2_kanban_card(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        fill: LinearRgba,
+        accent: LinearRgba,
+        count: usize,
+        max_count: usize,
+    ) -> anyhow::Result<()> {
+        self.filled_rectangle(layers, 0, rect, fill)?;
+        let border = rgba(0.24, 0.29, 0.38, 0.82);
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), rect.min_y(), rect.width(), 1.0),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), rect.max_y() - 1.0, rect.width(), 1.0),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), rect.min_y(), 1.0, rect.height()),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.max_x() - 1.0, rect.min_y(), 1.0, rect.height()),
+            border,
+        )?;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), rect.min_y(), 5.0, rect.height()),
+            accent,
+        )?;
+
+        if count > 0 && rect.width() > 36.0 && rect.height() > 24.0 {
+            let ratio = (count as f32 / max_count as f32).clamp(0.18, 1.0);
+            let meter_width = (rect.width() - 28.0).max(1.0) * ratio;
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(rect.min_x() + 16.0, rect.max_y() - 10.0, meter_width, 3.0),
+                accent,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn paint_h2_kanban_timeline(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        slot_count: usize,
+        event_count: usize,
+        artifact_count: usize,
+    ) -> anyhow::Result<()> {
+        if rect.width() <= 6.0 || rect.height() <= 6.0 {
+            return Ok(());
+        }
+
+        let y = rect.min_y() + rect.height() / 2.0;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(rect.min_x(), y - 1.0, rect.width(), 2.0),
+            rgba(0.17, 0.21, 0.29, 0.90),
+        )?;
+
+        let stops = [
+            (slot_count, rect.min_x(), rgba(0.26, 0.78, 0.76, 0.95)),
+            (
+                event_count,
+                rect.min_x() + rect.width() / 2.0 - 4.0,
+                rgba(0.54, 0.48, 0.88, 0.95),
+            ),
+            (
+                artifact_count,
+                rect.max_x() - 8.0,
+                rgba(0.86, 0.63, 0.30, 0.95),
+            ),
+        ];
+
+        for (count, x, color) in stops.iter().copied() {
+            let fill = if count > 0 {
+                color
+            } else {
+                rgba(0.20, 0.24, 0.31, 0.90)
+            };
+            self.filled_rectangle(layers, 0, euclid::rect(x, y - 4.0, 8.0, 8.0), fill)?;
+        }
+
         Ok(())
     }
 
