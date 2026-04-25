@@ -283,8 +283,29 @@ fn kanban_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
         "H2 Kanban View".to_string(),
         format!("artifacts {artifact_count}"),
         String::new(),
-        "Events".to_string(),
     ];
+
+    if let Some(items) = snapshot.get("slots").and_then(Value::as_array) {
+        if !items.is_empty() {
+            lines.push("Slots".to_string());
+            for item in items.iter().take(6) {
+                let slot = item
+                    .get("slot")
+                    .map(format_slot)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let head = item
+                    .get("head")
+                    .and_then(Value::as_str)
+                    .map(short_artifact_id)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let seq = item.get("seq").and_then(Value::as_u64).unwrap_or_default();
+                lines.push(format!("{slot}  {head}  seq {seq}"));
+            }
+            lines.push(String::new());
+        }
+    }
+
+    lines.push("Events".to_string());
 
     if let Some(items) = snapshot.get("events").and_then(Value::as_array) {
         for item in items.iter().take(10) {
@@ -328,6 +349,10 @@ fn format_slot(slot: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     format!("{node}/{name}")
+}
+
+fn short_artifact_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 fn send_rpc(socket_path: &Path, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -460,6 +485,13 @@ mod tests {
                 {"seq": 9, "type": "trace_log"}
             ],
             "artifact_count": 1,
+            "slots": [
+                {
+                    "slot": {"node": "canvas", "name": "note"},
+                    "head": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "seq": 7
+                }
+            ],
             "artifacts": [
                 {"seq": 7, "kind": "text", "slot": {"node": "canvas", "name": "note"}}
             ]
@@ -470,6 +502,9 @@ mod tests {
             vec![
                 "H2 Kanban View".to_string(),
                 "artifacts 1".to_string(),
+                "".to_string(),
+                "Slots".to_string(),
+                "canvas/note  01234567  seq 7".to_string(),
                 "".to_string(),
                 "Events".to_string(),
                 "8  node_registered".to_string(),
