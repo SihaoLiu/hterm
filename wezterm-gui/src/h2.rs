@@ -1,10 +1,14 @@
 use crate::termwindow::TermWindowNotif;
 use anyhow::{anyhow, Context};
+use mux::h2::{H2Pane, H2PaneKind};
+use mux::pane::Pane;
+use mux::tab::{SplitDirection, SplitRequest, SplitSize};
+use mux::{Mux, MuxNotification};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 use window::WindowOps;
 
@@ -12,6 +16,13 @@ const UI_SOCKET_ENV: &str = "H2_UI_SOCKET";
 const NODE_SOCKET_ENV: &str = "H2_NODE_SOCKET";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 static STATUS_BRIDGE: Once = Once::new();
+static DASHBOARD_PANES: Mutex<Option<DashboardPanes>> = Mutex::new(None);
+
+#[derive(Clone)]
+struct DashboardPanes {
+    graph: Arc<H2Pane>,
+    kanban: Arc<H2Pane>,
+}
 
 pub fn maybe_start_status_bridge() {
     let socket_paths = status_socket_paths_from_values(
@@ -45,8 +56,11 @@ fn status_socket_paths_from_values(
 
 fn run_status_bridge(socket_paths: Vec<PathBuf>) {
     loop {
-        let status_line = match poll_status_line(&socket_paths) {
-            Ok(line) => line,
+        let status_line = match poll_snapshot(&socket_paths) {
+            Ok(snapshot) => {
+                update_h2_dashboard(snapshot.clone());
+                format_snapshot_status_line(&snapshot)
+            }
             Err(err) => {
                 log::trace!("h2 status bridge poll failed: {err:#}");
                 "H2 disconnected".to_string()
@@ -65,7 +79,7 @@ fn poll_interval_ms() -> u64 {
         .unwrap_or(DEFAULT_POLL_INTERVAL_MS)
 }
 
-fn poll_status_line(socket_paths: &[PathBuf]) -> anyhow::Result<String> {
+fn poll_snapshot(socket_paths: &[PathBuf]) -> anyhow::Result<Value> {
     let mut last_error = None;
     for socket_path in socket_paths {
         match send_rpc(
@@ -79,7 +93,7 @@ fn poll_status_line(socket_paths: &[PathBuf]) -> anyhow::Result<String> {
         )
         .context("ui_snapshot")
         {
-            Ok(snapshot) => return Ok(format_snapshot_status_line(&snapshot)),
+            Ok(snapshot) => return Ok(snapshot),
             Err(err) => {
                 last_error = Some(err);
             }
@@ -87,6 +101,98 @@ fn poll_status_line(socket_paths: &[PathBuf]) -> anyhow::Result<String> {
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("no h2 socket candidates")))
+}
+
+fn update_h2_dashboard(snapshot: Value) {
+    promise::spawn::spawn_into_main_thread(async move {
+        let Some(panes) = ensure_h2_dashboard_panes() else {
+            return;
+        };
+
+        panes.graph.set_lines(graph_lines_from_snapshot(&snapshot));
+        panes
+            .kanban
+            .set_lines(kanban_lines_from_snapshot(&snapshot));
+
+        let mux = Mux::get();
+        mux.notify(MuxNotification::PaneOutput(panes.graph.pane_id()));
+        mux.notify(MuxNotification::PaneOutput(panes.kanban.pane_id()));
+    })
+    .detach();
+}
+
+fn ensure_h2_dashboard_panes() -> Option<DashboardPanes> {
+    if let Some(existing) = DASHBOARD_PANES.lock().ok()?.as_ref().cloned() {
+        return Some(existing);
+    }
+    if std::env::var_os("H2_DISABLE_BOOTSTRAP_PANES").is_some() {
+        return None;
+    }
+
+    let front_end = crate::frontend::try_front_end()?;
+    let gui_window = front_end.gui_windows().into_iter().next()?;
+    let mux = Mux::get();
+    let tab = mux.get_active_tab_for_window(gui_window.mux_window_id)?;
+    let active = tab.get_active_pane()?;
+    let active_index = tab
+        .iter_panes_ignoring_zoom()
+        .iter()
+        .find(|pos| pos.pane.pane_id() == active.pane_id())
+        .map(|pos| pos.index)?;
+    let size = tab.get_size();
+
+    let graph = H2Pane::new(H2PaneKind::Graph, size);
+    let kanban = H2Pane::new(H2PaneKind::Kanban, size);
+
+    let graph_pane: Arc<dyn Pane> = graph.clone();
+    let kanban_pane: Arc<dyn Pane> = kanban.clone();
+
+    let graph_index = match tab.split_and_insert(
+        active_index,
+        SplitRequest {
+            direction: SplitDirection::Horizontal,
+            target_is_second: true,
+            top_level: false,
+            size: SplitSize::Percent(34),
+        },
+        graph_pane.clone(),
+    ) {
+        Ok(index) => index,
+        Err(err) => {
+            log::warn!("failed to insert H2 graph pane: {err:#}");
+            return None;
+        }
+    };
+
+    if let Err(err) = tab.split_and_insert(
+        graph_index,
+        SplitRequest {
+            direction: SplitDirection::Vertical,
+            target_is_second: true,
+            top_level: false,
+            size: SplitSize::Percent(50),
+        },
+        kanban_pane.clone(),
+    ) {
+        log::warn!("failed to insert H2 kanban pane: {err:#}");
+        return None;
+    }
+
+    if let Err(err) = mux.add_pane(&graph_pane) {
+        log::warn!("failed to register H2 graph pane: {err:#}");
+        return None;
+    }
+    if let Err(err) = mux.add_pane(&kanban_pane) {
+        log::warn!("failed to register H2 kanban pane: {err:#}");
+        return None;
+    }
+
+    tab.set_active_pane(&active);
+    mux.notify(MuxNotification::TabResized(tab.tab_id()));
+
+    let panes = DashboardPanes { graph, kanban };
+    *DASHBOARD_PANES.lock().ok()? = Some(panes.clone());
+    Some(panes)
 }
 
 fn set_right_status(status: String) {
@@ -132,6 +238,96 @@ fn format_snapshot_status_line(snapshot: &Value) -> String {
         .unwrap_or("idle");
 
     format!("H2 seq={seq} nodes={nodes} artifacts={artifact_count} last={last_event}")
+}
+
+fn graph_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
+    let seq = snapshot
+        .get("status")
+        .and_then(|status| status.get("events_seq"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let nodes = snapshot
+        .get("status")
+        .and_then(|status| status.get("registered_nodes"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let mut lines = vec![
+        "H2 Graph View".to_string(),
+        format!("seq {seq}  live nodes {nodes}"),
+        String::new(),
+    ];
+
+    if let Some(items) = snapshot.get("nodes").and_then(Value::as_array) {
+        for item in items.iter().take(12) {
+            let node = item
+                .get("node")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let runtime = item
+                .get("runtime")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            lines.push(format!("{node}  {runtime}"));
+        }
+    }
+
+    lines
+}
+
+fn kanban_lines_from_snapshot(snapshot: &Value) -> Vec<String> {
+    let artifact_count = snapshot
+        .get("artifact_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let mut lines = vec![
+        "H2 Kanban View".to_string(),
+        format!("artifacts {artifact_count}"),
+        String::new(),
+        "Events".to_string(),
+    ];
+
+    if let Some(items) = snapshot.get("events").and_then(Value::as_array) {
+        for item in items.iter().take(10) {
+            let seq = item.get("seq").and_then(Value::as_u64).unwrap_or_default();
+            let kind = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            lines.push(format!("{seq}  {kind}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Artifacts".to_string());
+
+    if let Some(items) = snapshot.get("artifacts").and_then(Value::as_array) {
+        for item in items.iter().take(8) {
+            let seq = item.get("seq").and_then(Value::as_u64).unwrap_or_default();
+            let kind = item
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let slot = item
+                .get("slot")
+                .map(format_slot)
+                .unwrap_or_else(|| "unknown".to_string());
+            lines.push(format!("{seq}  {kind}  {slot}"));
+        }
+    }
+
+    lines
+}
+
+fn format_slot(slot: &Value) -> String {
+    let node = slot
+        .get("node")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let name = slot
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!("{node}/{name}")
 }
 
 fn send_rpc(socket_path: &Path, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -229,5 +425,59 @@ mod tests {
             status_socket_paths_from_values(None, Some("temp/h2-runtime/node.sock".into()));
 
         assert_eq!(chosen, vec![PathBuf::from("temp/h2-runtime/node.sock")]);
+    }
+
+    #[test]
+    fn graph_lines_show_live_nodes_from_snapshot() {
+        let snapshot = serde_json::json!({
+            "status": {
+                "events_seq": 9,
+                "registered_nodes": 2
+            },
+            "nodes": [
+                {"node": "canvas", "runtime": "hterm-local-pane"},
+                {"node": "agent-a", "runtime": "codex"}
+            ]
+        });
+
+        assert_eq!(
+            graph_lines_from_snapshot(&snapshot),
+            vec![
+                "H2 Graph View".to_string(),
+                "seq 9  live nodes 2".to_string(),
+                "".to_string(),
+                "canvas  hterm-local-pane".to_string(),
+                "agent-a  codex".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn kanban_lines_show_events_and_artifacts_from_snapshot() {
+        let snapshot = serde_json::json!({
+            "events": [
+                {"seq": 8, "type": "node_registered"},
+                {"seq": 9, "type": "trace_log"}
+            ],
+            "artifact_count": 1,
+            "artifacts": [
+                {"seq": 7, "kind": "text", "slot": {"node": "canvas", "name": "note"}}
+            ]
+        });
+
+        assert_eq!(
+            kanban_lines_from_snapshot(&snapshot),
+            vec![
+                "H2 Kanban View".to_string(),
+                "artifacts 1".to_string(),
+                "".to_string(),
+                "Events".to_string(),
+                "8  node_registered".to_string(),
+                "9  trace_log".to_string(),
+                "".to_string(),
+                "Artifacts".to_string(),
+                "7  text  canvas/note".to_string()
+            ]
+        );
     }
 }
